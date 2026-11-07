@@ -1,3 +1,9 @@
+/**
+ ******************************************************************************
+ * @file    pid.c
+ * @brief   PID 控制器实现（components 层）
+ ******************************************************************************
+ */
 #include "pid.h"
 
 void PID_Reset(pid_t *pid)
@@ -31,15 +37,27 @@ float PID_Calc(pid_t *pid, float ref, float fdb)
     pid->p_out = pid->kp * pid->err;
 
     pid->i_out += pid->ki * pid->err;
-    if (pid->i_out >  pid->i_max) pid->i_out =  pid->i_max;
-    if (pid->i_out < -pid->i_max) pid->i_out = -pid->i_max;
+    if (pid->i_out >  pid->i_max)
+    {
+        pid->i_out =  pid->i_max;
+    }
+    if (pid->i_out < -pid->i_max)
+    {
+        pid->i_out = -pid->i_max;
+    }
 
     pid->d_out    = pid->kd * (pid->err - pid->last_err);
     pid->last_err = pid->err;
 
     pid->output = pid->p_out + pid->i_out + pid->d_out;
-    if (pid->output >  pid->out_max) pid->output =  pid->out_max;
-    if (pid->output < -pid->out_max) pid->output = -pid->out_max;
+    if (pid->output >  pid->out_max)
+    {
+        pid->output =  pid->out_max;
+    }
+    if (pid->output < -pid->out_max)
+    {
+        pid->output = -pid->out_max;
+    }
 
     return pid->output;
 }

@@ -28,14 +28,10 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include <stdio.h>
-#include <string.h>
-#include "tim.h"
-#include "gpio.h"
 #include "bsp_can.h"
-#include "gm6020.h"
-#include "pid.h"
-#include "app_uart.h"
+#include "bsp_gm6020.h"
+#include "bsp_uart.h"
+#include "app_tasks.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -63,81 +59,11 @@
 void SystemClock_Config(void);
 void MX_FREERTOS_Init(void);
 /* USER CODE BEGIN PFP */
-void StartMotorTask(void *argument);
-void StartUartTask(void *argument);
-void StartKeyTask(void *argument);
-void StartLedTask(void *argument);
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-pid_t speed_pid;
-
-volatile float target_speed = 0.0f;
-volatile float actual_speed = 0.0f;
-volatile float pid_output   = 0.0f;
-
-osThreadId_t motorTaskHandle;
-const osThreadAttr_t motorTask_attributes = {
-  .name = "motorTask",
-  .stack_size = 128 * 4,
-  .priority = (osPriority_t) osPriorityAboveNormal,
-};
-
-osThreadId_t uartTaskHandle;
-const osThreadAttr_t uartTask_attributes = {
-  .name = "uartTask",
-  .stack_size = 256 * 4,
-  .priority = (osPriority_t) osPriorityNormal,
-};
-
-osThreadId_t keyTaskHandle;
-const osThreadAttr_t keyTask_attributes = {
-  .name = "keyTask",
-  .stack_size = 128 * 4,
-  .priority = (osPriority_t) osPriorityNormal,
-};
-
-osThreadId_t ledTaskHandle;
-const osThreadAttr_t ledTask_attributes = {
-  .name = "ledTask",
-  .stack_size = 128 * 4,
-  .priority = (osPriority_t) osPriorityLow,
-};
-
-static void uart_append_int(char *buf, int *pos, int value)
-{
-  char tmp[8];
-  int  n   = 0;
-  int  neg = 0;
-
-  if (value < 0)
-  {
-    neg   = 1;
-    value = -value;
-  }
-  if (value == 0)
-  {
-    tmp[n++] = '0';
-  }
-  while (value > 0)
-  {
-    tmp[n++] = (char)('0' + (value % 10));
-    value /= 10;
-  }
-  if (neg)
-  {
-    tmp[n++] = '-';
-  }
-  while (n > 0)
-  {
-    buf[(*pos)++] = tmp[--n];
-  }
-}
-
-
-
-
 
 /* USER CODE END 0 */
 
@@ -181,31 +107,25 @@ int main(void)
 
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
   __HAL_TIM_MOE_ENABLE(&htim1);
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 500);
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 500U);
 
   HAL_TIM_PWM_Start(&htim5, TIM_CHANNEL_3);
-  __HAL_TIM_SET_COMPARE(&htim5, TIM_CHANNEL_3, 0);
+  __HAL_TIM_SET_COMPARE(&htim5, TIM_CHANNEL_3, 0U);
 
   HAL_GPIO_WritePin(LED_G_GPIO_Port, LED_G_Pin, GPIO_PIN_RESET);
   HAL_GPIO_WritePin(LED_B_GPIO_Port, LED_B_Pin, GPIO_PIN_RESET);
 
-  can_init(gm6020_rx);
-  gm6020_init(1);
-
-  PID_Init(&speed_pid, 60.0f, 0.3f, 0.0f, 20000.0f, 30000.0f);
-
-  AppUart_Init();
+  BSP_CAN_Init(GM6020_Rx_Callback);
+  GM6020_Init(1U);
+  BSP_UART_Init();
   /* USER CODE END 2 */
 
   /* Init scheduler */
   osKernelInitialize();  /* Call init function for freertos objects (in cmsis_os2.c) */
   MX_FREERTOS_Init();
 
-
-  motorTaskHandle = osThreadNew(StartMotorTask, NULL, &motorTask_attributes);
-  uartTaskHandle  = osThreadNew(StartUartTask,  NULL, &uartTask_attributes);
-  keyTaskHandle   = osThreadNew(StartKeyTask,   NULL, &keyTask_attributes);
-  ledTaskHandle   = osThreadNew(StartLedTask,   NULL, &ledTask_attributes);
+  /* 任务必须在 osKernelInitialize 之后创建，CubeMX 重新生成代码时会覆盖本行 */
+  App_Tasks_Create();
 
   /* Start scheduler */
   osKernelStart();
@@ -269,141 +189,6 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
-
-void StartMotorTask(void *argument)
-{
-  (void)argument;
-
-  for (;;)
-  {
-    gm6020_watchdog();
-    actual_speed += 0.10f * ((float)motor_speed - actual_speed);
-
-    if (motor_online)
-    {
-      pid_output = PID_Calc(&speed_pid, target_speed, actual_speed);
-      gm6020_set_current((int16_t)pid_output);
-    }
-    else
-    {
-      PID_Reset(&speed_pid);
-      actual_speed = 0.0f;
-      pid_output   = 0.0f;
-      gm6020_set_current(0);
-    }
-
-    osDelay(5);
-  }
-}
-
-void StartUartTask(void *argument)
-{
-  char     cmd[32];
-  char     msg[48];
-  uint32_t last_print = osKernelGetTickCount();
-
-  (void)argument;
-
-  for (;;)
-  {
-    if (AppUart_GetCommand(cmd, sizeof(cmd))){
-      if (strncmp(cmd, "motor", 5) == 0){
-        int i     = 6;
-        int sign  = 1;
-        int value = 0;
-
-        if (cmd[5] == '-')sign = -1;
-        else if (cmd[5] == '+')sign = 1;
-        while (cmd[i] >= '0' && cmd[i] <= '9'){
-          value = value * 10 + (cmd[i] - '0');
-          i++;
-        }
-
-        target_speed = (float)(sign * value);
-      }
-    }
-
-    if ((osKernelGetTickCount() - last_print) >= 2000U){
-      int p = 0;
-      last_print = osKernelGetTickCount();
-
-      memcpy(&msg[p], "speed:", 6);
-      p += 6;
-      uart_append_int(msg, &p, (int)motor_speed);
-      memcpy(&msg[p], " rpm\r\n", 6);
-      p += 6;
-      msg[p] = '\0';
-
-      AppUart_SendString(msg);
-    }
-
-    osDelay(20);
-  }
-}
-
-  void StartKeyTask(void *argument)
-{
-  int32_t angle_deg  = 0;
-  int8_t  way        = 1;
-  uint8_t last_level = 1;
-
-  (void)argument;
-  for (;;){
-    uint8_t level = (uint8_t)HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0);
-
-    if ((last_level == 1U) && (level == 0U)){
-      angle_deg += (int32_t)way * 20;
-
-      if (angle_deg >= 180){
-        angle_deg = 180;
-        way = -1;
-      }
-      else if (angle_deg <= 0){
-        angle_deg = 0;
-        way = 1;
-      }
-
-      __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1,(uint32_t)(500 + angle_deg * 2000 / 180));
-    }
-
-    last_level = level;
-    osDelay(10);
-  }
-}
-
-void StartLedTask(void *argument)
-{
-  int32_t duty = 0;
-  int8_t  dir  = 1;
-
-  (void)argument;
-
-  for (;;){
-    if (motor_online){
-      duty = 0;
-      dir  = 1;
-      __HAL_TIM_SET_COMPARE(&htim5, TIM_CHANNEL_3, 0);
-      HAL_GPIO_WritePin(LED_G_GPIO_Port, LED_G_Pin, GPIO_PIN_SET);
-    }
-    else
-    {
-      HAL_GPIO_WritePin(LED_G_GPIO_Port, LED_G_Pin, GPIO_PIN_RESET);
-
-      duty += (int32_t)dir * 10;
-      if (duty >= 1000){
-        duty = 1000;
-        dir  = -1;
-      }
-      if (duty <= 0){
-        duty = 0;
-        dir  = 1;
-      }
-      __HAL_TIM_SET_COMPARE(&htim5, TIM_CHANNEL_3, (uint32_t)duty);
-    }
-
-    osDelay(10);
-  }
-}
 
 /* USER CODE END 4 */
 
