@@ -1,0 +1,108 @@
+#include <stm32f4xx_hal.h>
+#include <stm32f4xx_hal_can.h>
+#include "bsp_can.h"
+
+
+volatile uint32_t can_tx_count = 0;
+volatile uint32_t can_rx_count = 0;
+volatile int8_t   can_last_error = 0;
+
+/* 调试用：记录总线上最近出现的 4 个不同 ID，用来确认电机反馈 ID */
+volatile uint32_t can_rx_id_slot[4] = {0, 0, 0, 0};
+/* 调试用：记录最近一帧实际发出的 8 个字节和 ID */
+volatile uint8_t  can_tx_debug[8] = {0};
+volatile uint32_t can_tx_debug_id = 0;
+
+
+static can_rx_handler_t s_handler = 0;
+
+
+void can_filter_init(void) {
+    CAN_FilterTypeDef can_filter_st = {0};
+
+    can_filter_st.FilterActivation = ENABLE;
+    can_filter_st.FilterMode = CAN_FILTERMODE_IDMASK;
+    can_filter_st.FilterScale = CAN_FILTERSCALE_32BIT;
+    can_filter_st.FilterIdHigh = 0x0000;
+    can_filter_st.FilterIdLow = 0x0000;
+    can_filter_st.FilterMaskIdHigh = 0x0000;
+    can_filter_st.FilterMaskIdLow = 0x0000;
+    can_filter_st.FilterBank = 0;
+    can_filter_st.FilterFIFOAssignment = CAN_RX_FIFO0;
+    HAL_CAN_ConfigFilter(&hcan1, &can_filter_st);
+    HAL_CAN_Start(&hcan1);
+    HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING);
+
+}
+
+
+void HAL_CAN_ErrorCallback(CAN_HandleTypeDef *hcan)
+{
+    if (hcan->Instance != CAN1) return;
+    can_last_error = (int8_t)hcan->ErrorCode;
+}
+
+
+
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
+{
+    CAN_RxHeaderTypeDef rx;
+    uint8_t data[8];
+    if (hcan->Instance != CAN1) return;
+    if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rx, data) != HAL_OK) return;
+
+    can_rx_count++;
+
+    /* 新 ID 插到最前面，只记不同的值，避免 1kHz 刷屏 */
+    if (can_rx_id_slot[0] != rx.StdId)
+    {
+        can_rx_id_slot[3] = can_rx_id_slot[2];
+        can_rx_id_slot[2] = can_rx_id_slot[1];
+        can_rx_id_slot[1] = can_rx_id_slot[0];
+        can_rx_id_slot[0] = rx.StdId;
+    }
+
+    if (s_handler != 0)
+        s_handler(rx.StdId, data, (uint8_t)rx.DLC);
+}
+
+void can_init(can_rx_handler_t handler)
+{
+    s_handler = handler;
+    can_filter_init();
+    HAL_NVIC_SetPriority(CAN1_RX0_IRQn, 5, 0);
+    HAL_NVIC_EnableIRQ(CAN1_RX0_IRQn);
+}
+
+int can_send(uint32_t std_id, const uint8_t data[8])
+{
+    CAN_TxHeaderTypeDef tx;
+    uint32_t mailbox = 0;
+    HAL_StatusTypeDef st;
+
+    tx.StdId = std_id;
+    tx.ExtId = 0;
+    tx.IDE   = CAN_ID_STD;
+    tx.RTR   = CAN_RTR_DATA;
+    tx.DLC   = 8;
+    tx.TransmitGlobalTime = DISABLE;
+
+
+    if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) == 0)
+    {
+        can_last_error = -1;
+        return -1;
+    }
+
+    for (int i = 0; i < 8; i++) can_tx_debug[i] = data[i];
+    can_tx_debug_id = std_id;
+    st = HAL_CAN_AddTxMessage(&hcan1, &tx, (uint8_t *)data, &mailbox);
+    if (st != HAL_OK)
+    {
+        can_last_error = -2;
+        return -2;
+    }
+
+    can_tx_count++;
+    return 0;
+}
